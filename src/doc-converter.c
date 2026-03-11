@@ -24,12 +24,22 @@
 #include <zlib.h>
 #endif
 
+#ifdef HAVE_PANGOCAIRO
+#include <cairo.h>
+#include <cairo-pdf.h>
+#include <pango/pangocairo.h>
+#endif
+
 #include "lib/stdio_helpers.h"
 #include "lookup/short_character_references.h"
 #include "lookup/full_character_references.h"
 
 static bool strict_mode = false;
 static size_t max_bytes = 268435456;	// 0 = unlimited
+static const char *pdf_font_text = NULL;
+static const char *pdf_font_serif = NULL;
+static const char *pdf_font_sans = NULL;
+static const char *pdf_font_mono = NULL;
 
 // Codepoint mapping for short character references (index = enum value)
 static const uint32_t short_character_reference_codepoints[] = {
@@ -1238,9 +1248,17 @@ static struct inline_node *md_parse_inlines(const char *text, size_t len)
 	size_t i = 0;
 	while (i < len) {
 		char c = text[i];
+		bool underscore_inside_word = false;
+
+		if (c == '_' &&
+			i > 0 && isalnum((unsigned char)text[i - 1]) &&
+			i + 1 < len && isalnum((unsigned char)text[i + 1])) {
+			underscore_inside_word = true;
+		}
 
 		// Bold: **text** or __text__
-		if ((c == '*' || c == '_') && i + 1 < len && text[i + 1] == c) {
+		if ((c == '*' || c == '_') && i + 1 < len && text[i + 1] == c &&
+			!(c == '_' && underscore_inside_word)) {
 			char delim = c;
 			size_t start = i + 2;
 			size_t end = (delim == '*')
@@ -1267,7 +1285,8 @@ static struct inline_node *md_parse_inlines(const char *text, size_t len)
 		}
 
 		// Italic: *text* or _text_
-		if ((c == '*' || c == '_') && i + 1 < len && text[i + 1] != c) {
+		if ((c == '*' || c == '_') && i + 1 < len && text[i + 1] != c &&
+			!(c == '_' && underscore_inside_word)) {
 			char delim = c;
 			size_t start = i + 1;
 			size_t end = (delim == '*')
@@ -7724,202 +7743,468 @@ static char *write_epub(struct document *doc, size_t *out_len)
 
 #define PDF_PAGE_WIDTH 612
 #define PDF_PAGE_HEIGHT 792
-#define PDF_MARGIN_LEFT 50
-#define PDF_MARGIN_RIGHT 50
-#define PDF_MARGIN_TOP 750
-#define PDF_MARGIN_BOTTOM 50
+#define PDF_MARGIN_LEFT 40
+#define PDF_MARGIN_RIGHT 40
+#define PDF_MARGIN_TOP 760
+#define PDF_MARGIN_BOTTOM 40
+#define PDF_BODY_FONT_SIZE 11
+#define PDF_LINE_GAP 3
+#define PDF_PARAGRAPH_GAP 6
+#define PDF_HEADING_GAP 8
 
 struct pdf_writer {
 	struct buffer buf;
 	size_t *offsets;
-	int num_objects;
-	int cap_objects;
-	int page_content_obj;
-	struct buffer content;
+	struct buffer *pages;
+	int num_pages;
+	int cap_pages;
 	int y_pos;
-	int font_size;
 };
 
 static void pdf_init(struct pdf_writer *pdf)
 {
 	buf_init(&pdf->buf);
-	buf_init(&pdf->content);
 	pdf->offsets = NULL;
-	pdf->num_objects = 0;
-	pdf->cap_objects = 0;
+	pdf->pages = NULL;
+	pdf->num_pages = 0;
+	pdf->cap_pages = 0;
 	pdf->y_pos = PDF_MARGIN_TOP;
-	pdf->font_size = 12;
 
 	buf_puts(&pdf->buf, "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 }
 
-static int pdf_add_object(struct pdf_writer *pdf)
+static void pdf_add_page(struct pdf_writer *pdf)
 {
-	if (pdf->num_objects >= pdf->cap_objects) {
-		pdf->cap_objects = pdf->cap_objects ? pdf->cap_objects * 2 : 16;
-		void *new_offsets = realloc(pdf->offsets, (size_t)pdf->cap_objects * sizeof(size_t));
-		if (!new_offsets) {
+	if (pdf->num_pages >= pdf->cap_pages) {
+		int new_cap = pdf->cap_pages ? pdf->cap_pages * 2 : 4;
+		void *new_pages = realloc(pdf->pages, (size_t)new_cap * sizeof(*pdf->pages));
+		if (!new_pages) {
 			PUTS_ERR("Error: out of memory\n");
 			exit(1);
 		}
-		pdf->offsets = new_offsets;
+		pdf->pages = new_pages;
+		pdf->cap_pages = new_cap;
 	}
-	pdf->offsets[pdf->num_objects] = pdf->buf.len;
-	return ++pdf->num_objects;
+
+	buf_init(&pdf->pages[pdf->num_pages]);
+	pdf->num_pages++;
+	pdf->y_pos = PDF_MARGIN_TOP;
+}
+
+static struct buffer *pdf_current_page(struct pdf_writer *pdf)
+{
+	if (pdf->num_pages == 0)
+		pdf_add_page(pdf);
+	return &pdf->pages[pdf->num_pages - 1];
+}
+
+static void pdf_ensure_space(struct pdf_writer *pdf, int needed_height)
+{
+	if (pdf->num_pages == 0) {
+		pdf_add_page(pdf);
+		return;
+	}
+
+	if (pdf->y_pos - needed_height < PDF_MARGIN_BOTTOM)
+		pdf_add_page(pdf);
+}
+
+static void pdf_add_vertical_space(struct pdf_writer *pdf, int amount)
+{
+	if (amount <= 0)
+		return;
+
+	pdf_ensure_space(pdf, amount);
+	pdf->y_pos -= amount;
 }
 
 static void pdf_escape_string(struct buffer *buf, const char *s)
 {
+	static const char octal_digits[] = "01234567";
+
 	buf_putc(buf, '(');
 	while (*s) {
-		if (*s == '(' || *s == ')' || *s == '\\')
+		unsigned char c = (unsigned char)*s++;
+		if (c == '(' || c == ')' || c == '\\') {
 			buf_putc(buf, '\\');
-		buf_putc(buf, *s++);
+			buf_putc(buf, (char)c);
+			continue;
+		}
+		if (c == '\n') {
+			buf_puts(buf, "\\n");
+			continue;
+		}
+		if (c == '\r') {
+			buf_puts(buf, "\\r");
+			continue;
+		}
+		if (c == '\t') {
+			buf_puts(buf, "\\t");
+			continue;
+		}
+		if (c < 32 || c > 126) {
+			buf_putc(buf, '\\');
+			buf_putc(buf, octal_digits[(c >> 6) & 0x07u]);
+			buf_putc(buf, octal_digits[(c >> 3) & 0x07u]);
+			buf_putc(buf, octal_digits[c & 0x07u]);
+			continue;
+		}
+		buf_putc(buf, (char)c);
 	}
 	buf_putc(buf, ')');
 }
 
-static void pdf_write_text(struct pdf_writer *pdf, const char *text, bool bold, bool italic)
+static uint32_t pdf_decode_utf8(const char *s, size_t *advance)
 {
-	if (pdf->y_pos < PDF_MARGIN_BOTTOM) {
-		// New page needed - simplified, just continue
-		pdf->y_pos = PDF_MARGIN_TOP;
+	unsigned char c0 = (unsigned char)s[0];
+
+	if (c0 < 0x80) {
+		*advance = 1;
+		return c0;
 	}
 
-	buf_puts(&pdf->content, "BT\n");
-	buf_printf(&pdf->content, "/F%d %d Tf\n", (bold ? 2 : 1) + (italic ? 2 : 0), pdf->font_size);
-	buf_printf(&pdf->content, "%d %d Td\n", PDF_MARGIN_LEFT, pdf->y_pos);
-	pdf_escape_string(&pdf->content, text);
-	buf_puts(&pdf->content, " Tj\nET\n");
+	if ((c0 & 0xE0u) == 0xC0u &&
+		((unsigned char)s[1] & 0xC0u) == 0x80u) {
+		*advance = 2;
+		return ((uint32_t)(c0 & 0x1Fu) << 6) |
+			(uint32_t)((unsigned char)s[1] & 0x3Fu);
+	}
 
-	pdf->y_pos -= pdf->font_size + 4;
+	if ((c0 & 0xF0u) == 0xE0u &&
+		((unsigned char)s[1] & 0xC0u) == 0x80u &&
+		((unsigned char)s[2] & 0xC0u) == 0x80u) {
+		*advance = 3;
+		return ((uint32_t)(c0 & 0x0Fu) << 12) |
+			((uint32_t)((unsigned char)s[1] & 0x3Fu) << 6) |
+			(uint32_t)((unsigned char)s[2] & 0x3Fu);
+	}
+
+	if ((c0 & 0xF8u) == 0xF0u &&
+		((unsigned char)s[1] & 0xC0u) == 0x80u &&
+		((unsigned char)s[2] & 0xC0u) == 0x80u &&
+		((unsigned char)s[3] & 0xC0u) == 0x80u) {
+		*advance = 4;
+		return ((uint32_t)(c0 & 0x07u) << 18) |
+			((uint32_t)((unsigned char)s[1] & 0x3Fu) << 12) |
+			((uint32_t)((unsigned char)s[2] & 0x3Fu) << 6) |
+			(uint32_t)((unsigned char)s[3] & 0x3Fu);
+	}
+
+	*advance = 1;
+	return c0;
 }
 
-static void pdf_write_inlines(struct pdf_writer *pdf, struct inline_node *node, bool bold, bool italic)
+static bool pdf_put_winansi_codepoint(struct buffer *buf, uint32_t code)
 {
-	struct buffer line;
-	buf_init(&line);
+	switch (code) {
+		case '\t':
+		case '\r':
+		case 0xA0:
+		case 0x2002:
+		case 0x2003:
+		case 0x2004:
+		case 0x2005:
+		case 0x2007:
+		case 0x2009:
+		case 0x202F:
+			buf_putc(buf, ' ');
+			return true;
+		case 0x2013:
+			buf_putc(buf, (char)0x96);
+			return true;
+		case 0x2014:
+			buf_putc(buf, (char)0x97);
+			return true;
+		case 0x2022:
+		case 0x2011:
+			buf_putc(buf, (char)0x95);
+			return true;
+		case 0x2010:
+		case 0x2012:
+		case 0x2212:
+			buf_putc(buf, '-');
+			return true;
+		case 0x2018:
+		case 0x2032:
+			buf_putc(buf, (char)0x91);
+			return true;
+		case 0x2019:
+			buf_putc(buf, (char)0x92);
+			return true;
+		case 0x201C:
+		case 0x2033:
+			buf_putc(buf, (char)0x93);
+			return true;
+		case 0x201D:
+			buf_putc(buf, (char)0x94);
+			return true;
+		case 0x2026:
+			buf_putc(buf, (char)0x85);
+			return true;
+		case 0x20AC:
+			buf_putc(buf, (char)0x80);
+			return true;
+		case 0x2122:
+			buf_putc(buf, (char)0x99);
+			return true;
+		default:
+			break;
+	}
 
-	while (node) {
-		switch (node->type) {
-			case INLINE_TEXT:
-				buf_puts(&line, node->text);
-				break;
-			case INLINE_BOLD:
-				if (line.len > 0) {
-					buf_putc(&line, '\0');
-					pdf_write_text(pdf, line.data, bold, italic);
-					line.len = 0;
-				}
-				pdf_write_inlines(pdf, node->children, true, italic);
-				break;
-			case INLINE_ITALIC:
-				if (line.len > 0) {
-					buf_putc(&line, '\0');
-					pdf_write_text(pdf, line.data, bold, italic);
-					line.len = 0;
-				}
-				pdf_write_inlines(pdf, node->children, bold, true);
-				break;
-			case INLINE_CODE:
-				buf_puts(&line, node->text);
-				break;
-			case INLINE_LINK:
-				pdf_write_inlines(pdf, node->children, bold, italic);
-				break;
-			case INLINE_IMAGE:
-				// Skip images in simple PDF
-				break;
-			case INLINE_LINEBREAK:
-				if (line.len > 0) {
-					buf_putc(&line, '\0');
-					pdf_write_text(pdf, line.data, bold, italic);
-					line.len = 0;
-				}
-				break;
+	if (code == '\n') {
+		buf_putc(buf, '\n');
+		return true;
+	}
+
+	if (code >= 32 && code <= 126) {
+		buf_putc(buf, (char)code);
+		return true;
+	}
+
+	if (code >= 0xA0 && code <= 0xFF) {
+		buf_putc(buf, (char)code);
+		return true;
+	}
+
+	return false;
+}
+
+static char *pdf_encode_text(const char *text)
+{
+	struct buffer buf;
+	buf_init(&buf);
+
+	while (*text) {
+		size_t advance = 0;
+		uint32_t code = pdf_decode_utf8(text, &advance);
+		if (!pdf_put_winansi_codepoint(&buf, code))
+			buf_putc(&buf, '?');
+		text += advance;
+	}
+
+	return buf_finish_malloc(&buf);
+}
+
+static char *pdf_collect_inline_text(struct inline_node *node)
+{
+	struct buffer buf;
+	buf_init(&buf);
+	write_text_inlines(&buf, node);
+	buf_putc(&buf, '\0');
+
+	char *encoded = pdf_encode_text(buf.data ? buf.data : "");
+	buf_free(&buf);
+	return encoded;
+}
+
+static size_t pdf_max_chars(int font_size, int x_pos)
+{
+	int usable_width = PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT - x_pos;
+	if (usable_width <= font_size)
+		return 1;
+
+	size_t max_chars = (size_t)((usable_width * 100) / (font_size * 55));
+	return max_chars > 0 ? max_chars : 1;
+}
+
+static void pdf_write_line(struct pdf_writer *pdf, const char *text, int x_pos, int font_size, int font_id)
+{
+	int line_height = font_size + PDF_LINE_GAP;
+	struct buffer *content;
+
+	pdf_ensure_space(pdf, line_height);
+	content = pdf_current_page(pdf);
+
+	buf_puts(content, "BT\n");
+	buf_printf(content, "/F%d %d Tf\n", font_id, font_size);
+	buf_printf(content, "%d %d Td\n", x_pos, pdf->y_pos);
+	pdf_escape_string(content, text);
+	buf_puts(content, " Tj\nET\n");
+
+	pdf->y_pos -= line_height;
+}
+
+static void pdf_write_wrapped_range(struct pdf_writer *pdf, const char *start, const char *end,
+	int font_id, int font_size, int first_x, int rest_x)
+{
+	const char *p = start;
+	int x_pos = first_x;
+
+	while (p < end) {
+		const char *limit;
+		const char *break_at = NULL;
+		size_t max_len;
+
+		while (p < end && *p == ' ')
+			p++;
+		if (p >= end)
+			break;
+
+		max_len = pdf_max_chars(font_size, x_pos);
+		limit = p + max_len;
+		if ((size_t)(end - p) <= max_len) {
+			break_at = end;
+		} else {
+			const char *scan;
+			if (limit > end)
+				limit = end;
+			for (scan = p; scan < limit; scan++) {
+				if (*scan == ' ')
+					break_at = scan;
+			}
+			if (!break_at || break_at == p)
+				break_at = limit;
 		}
-		node = node->next;
-	}
 
-	if (line.len > 0) {
+		while (break_at > p && break_at[-1] == ' ')
+			break_at--;
+
+		struct buffer line;
+		buf_init(&line);
+		buf_write(&line, p, (size_t)(break_at - p));
 		buf_putc(&line, '\0');
-		pdf_write_text(pdf, line.data, bold, italic);
+		pdf_write_line(pdf, line.data, x_pos, font_size, font_id);
+		buf_free(&line);
+
+		p = break_at;
+		while (p < end && *p == ' ')
+			p++;
+		x_pos = rest_x;
 	}
-	buf_free(&line);
 }
 
-static void pdf_write_blocks(struct pdf_writer *pdf, struct block_node *node)
+static void pdf_write_wrapped_text(struct pdf_writer *pdf, const char *text, int font_id, int font_size,
+	int first_x, int rest_x)
 {
+	const char *line = text;
+
+	while (line) {
+		const char *newline = strchr(line, '\n');
+		const char *end = newline ? newline : line + strlen(line);
+
+		if (line == end)
+			pdf_add_vertical_space(pdf, font_size + 4);
+		else
+			pdf_write_wrapped_range(pdf, line, end, font_id, font_size, first_x, rest_x);
+
+		if (!newline)
+			break;
+		line = newline + 1;
+	}
+}
+
+static void pdf_draw_rule(struct pdf_writer *pdf)
+{
+	struct buffer *content;
+
+	pdf_ensure_space(pdf, 20);
+	content = pdf_current_page(pdf);
+
+	buf_printf(content, "q\n0.5 w\n%d %d m %d %d l S\nQ\n",
+		PDF_MARGIN_LEFT, pdf->y_pos,
+		PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT, pdf->y_pos);
+	pdf->y_pos -= 20;
+}
+
+static void pdf_write_code_block(struct pdf_writer *pdf, const char *code, int x_pos)
+{
+	char *text = pdf_encode_text(code ? code : "");
+	pdf_write_wrapped_text(pdf, text, 3, 10, x_pos, x_pos);
+	pdf_add_vertical_space(pdf, PDF_PARAGRAPH_GAP);
+	free(text);
+}
+
+static void pdf_write_blocks(struct pdf_writer *pdf, struct block_node *node, int indent);
+
+static void pdf_write_list(struct pdf_writer *pdf, struct block_node *node, int indent)
+{
+	struct block_node *item = node->children;
+	int num = node->list.start;
+	int left = PDF_MARGIN_LEFT + indent;
+	int rest = left + 18;
+
+	while (item) {
+		if (item->children && item->children->type == BLOCK_PARAGRAPH && !item->children->next) {
+			char *text = pdf_collect_inline_text(item->children->inlines);
+			struct buffer combined;
+			buf_init(&combined);
+
+			if (node->list.ordered)
+				buf_printf(&combined, "%d. ", num++);
+			else {
+				buf_putc(&combined, (char)0x95);
+				buf_putc(&combined, ' ');
+			}
+
+			buf_puts(&combined, text);
+			buf_putc(&combined, '\0');
+
+			pdf_write_wrapped_text(pdf, combined.data, 1, PDF_BODY_FONT_SIZE, left, rest);
+			free(text);
+			buf_free(&combined);
+		} else {
+			struct buffer prefix;
+			buf_init(&prefix);
+
+			if (node->list.ordered)
+				buf_printf(&prefix, "%d.", num++);
+			else
+				buf_putc(&prefix, (char)0x95);
+
+			buf_putc(&prefix, '\0');
+			pdf_write_line(pdf, prefix.data, left, PDF_BODY_FONT_SIZE, 1);
+			buf_free(&prefix);
+			pdf_write_blocks(pdf, item->children, indent + 18);
+		}
+
+		item = item->next;
+	}
+
+	pdf_add_vertical_space(pdf, PDF_PARAGRAPH_GAP);
+}
+
+static void pdf_write_blocks(struct pdf_writer *pdf, struct block_node *node, int indent)
+{
+	int left = PDF_MARGIN_LEFT + indent;
+
 	while (node) {
 		switch (node->type) {
 			case BLOCK_PARAGRAPH:
-				pdf->font_size = 12;
-				pdf_write_inlines(pdf, node->inlines, false, false);
-				pdf->y_pos -= 8;  // Paragraph spacing
+				{
+					char *text = pdf_collect_inline_text(node->inlines);
+					pdf_write_wrapped_text(pdf, text, 1, PDF_BODY_FONT_SIZE, left, left);
+					pdf_add_vertical_space(pdf, PDF_PARAGRAPH_GAP);
+					free(text);
+				}
 				break;
 			case BLOCK_HEADING:
-				pdf->font_size = 24 - (node->heading.level - 1) * 2;
-				pdf_write_inlines(pdf, node->inlines, true, false);
-				pdf->font_size = 12;
-				pdf->y_pos -= 12;
+				{
+					int font_size = node->heading.level == 1 ? 20 : 16 - (node->heading.level - 2);
+					char *text;
+
+					if (font_size < 13)
+						font_size = 13;
+
+					text = pdf_collect_inline_text(node->inlines);
+					pdf_write_wrapped_text(pdf, text, 2, font_size, left, left);
+					pdf_add_vertical_space(pdf, PDF_HEADING_GAP);
+					free(text);
+				}
 				break;
 			case BLOCK_CODE_BLOCK:
-				// Write code as-is with monospace feel
-				{
-					char *code = node->code_block.code;
-					char *line = code;
-					while (*line) {
-						char *end = strchr(line, '\n');
-						if (end) {
-							char save = *end;
-							*end = '\0';
-							pdf_write_text(pdf, line, false, false);
-							*end = save;
-							line = end + 1;
-						} else {
-							pdf_write_text(pdf, line, false, false);
-							break;
-						}
-					}
-				}
-				pdf->y_pos -= 8;
+				pdf_write_code_block(pdf, node->code_block.code, left + 12);
 				break;
 			case BLOCK_BLOCKQUOTE:
-				// Simple indent
-				pdf_write_blocks(pdf, node->children);
-				pdf->y_pos -= 8;
+				pdf_write_blocks(pdf, node->children, indent + 20);
+				pdf_add_vertical_space(pdf, PDF_PARAGRAPH_GAP);
 				break;
 			case BLOCK_LIST:
-				{
-					struct block_node *item = node->children;
-					int num = node->list.start;
-					while (item) {
-						struct buffer prefix;
-						buf_init(&prefix);
-						if (node->list.ordered) {
-							buf_printf(&prefix, "%d. ", num++);
-						} else {
-							buf_puts(&prefix, "* ");
-						}
-						buf_putc(&prefix, '\0');
-						pdf_write_text(pdf, prefix.data, false, false);
-						buf_free(&prefix);
-
-						if (item->children && item->children->type == BLOCK_PARAGRAPH) {
-							pdf_write_inlines(pdf, item->children->inlines, false, false);
-						}
-						item = item->next;
-					}
-				}
-				pdf->y_pos -= 8;
+				pdf_write_list(pdf, node, indent);
 				break;
 			case BLOCK_LIST_ITEM:
 				break;
 			case BLOCK_THEMATIC_BREAK:
-				buf_printf(&pdf->content, "q\n0.5 w\n%d %d m %d %d l S\nQ\n",
-					PDF_MARGIN_LEFT, pdf->y_pos,
-					PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT, pdf->y_pos);
-				pdf->y_pos -= 20;
+				pdf_draw_rule(pdf);
 				break;
 			case BLOCK_TABLE:
 			case BLOCK_TABLE_ROW:
@@ -7930,65 +8215,506 @@ static void pdf_write_blocks(struct pdf_writer *pdf, struct block_node *node)
 	}
 }
 
-static char *write_pdf(struct document *doc, size_t *out_len)
+static void pdf_begin_object(struct pdf_writer *pdf, int object_num)
+{
+	pdf->offsets[object_num] = pdf->buf.len;
+	buf_printf(&pdf->buf, "%d 0 obj\n", object_num);
+}
+
+static void pdf_end_object(struct pdf_writer *pdf)
+{
+	buf_puts(&pdf->buf, "endobj\n");
+}
+
+static void pdf_free_pages(struct pdf_writer *pdf)
+{
+	for (int i = 0; i < pdf->num_pages; i++)
+		buf_free(&pdf->pages[i]);
+	free(pdf->pages);
+	pdf->pages = NULL;
+	pdf->num_pages = 0;
+	pdf->cap_pages = 0;
+}
+
+static char *write_pdf_basic(struct document *doc, size_t *out_len)
 {
 	struct pdf_writer pdf;
 	pdf_init(&pdf);
 
-	// Object 1: Catalog
-	int catalog = pdf_add_object(&pdf);
-	buf_printf(&pdf.buf, "%d 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n", catalog);
+	pdf_write_blocks(&pdf, doc->blocks, 0);
+	if (pdf.num_pages == 0)
+		pdf_add_page(&pdf);
 
-	// Object 2: Pages
-	int pages = pdf_add_object(&pdf);
-	buf_printf(&pdf.buf, "%d 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n", pages);
+	int catalog_obj = 1;
+	int pages_obj = 2;
+	int font_regular_obj = 3;
+	int font_bold_obj = 4;
+	int font_mono_obj = 5;
+	int total_objects = 5 + pdf.num_pages * 2;
 
-	// Object 3: Page
-	int page = pdf_add_object(&pdf);
-	buf_printf(&pdf.buf, "%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Contents 5 0 R /Resources << /Font << /F1 4 0 R /F2 6 0 R >> >> >>\nendobj\n", page, PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT);
+	pdf.offsets = calloc((size_t)total_objects + 1, sizeof(*pdf.offsets));
+	if (!pdf.offsets) {
+		PUTS_ERR("Error: out of memory\n");
+		pdf_free_pages(&pdf);
+		buf_free(&pdf.buf);
+		exit(1);
+	}
 
-	// Object 4: Font (regular)
-	int font1 = pdf_add_object(&pdf);
-	buf_printf(&pdf.buf, "%d 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n", font1);
+	pdf_begin_object(&pdf, catalog_obj);
+	buf_printf(&pdf.buf, "<< /Type /Catalog /Pages %d 0 R >>\n", pages_obj);
+	pdf_end_object(&pdf);
 
-	// Generate content
-	pdf_write_blocks(&pdf, doc->blocks);
+	pdf_begin_object(&pdf, pages_obj);
+	buf_puts(&pdf.buf, "<< /Type /Pages /Kids [");
+	for (int i = 0; i < pdf.num_pages; i++) {
+		int page_obj = 7 + i * 2;
+		buf_printf(&pdf.buf, "%d 0 R", page_obj);
+		if (i + 1 < pdf.num_pages)
+			buf_putc(&pdf.buf, ' ');
+	}
+	buf_printf(&pdf.buf, "] /Count %d >>\n", pdf.num_pages);
+	pdf_end_object(&pdf);
 
-	// Object 5: Content stream
-	int content = pdf_add_object(&pdf);
-	buf_printf(&pdf.buf, "%d 0 obj\n<< /Length %zu >>\nstream\n", content, pdf.content.len);
-	buf_write(&pdf.buf, pdf.content.data, pdf.content.len);
-	buf_puts(&pdf.buf, "endstream\nendobj\n");
+	pdf_begin_object(&pdf, font_regular_obj);
+	buf_puts(&pdf.buf, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\n");
+	pdf_end_object(&pdf);
 
-	// Object 6: Font (bold)
-	int font2 = pdf_add_object(&pdf);
-	buf_printf(&pdf.buf, "%d 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n", font2);
+	pdf_begin_object(&pdf, font_bold_obj);
+	buf_puts(&pdf.buf, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\n");
+	pdf_end_object(&pdf);
 
-	// Cross-reference table
+	pdf_begin_object(&pdf, font_mono_obj);
+	buf_puts(&pdf.buf, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>\n");
+	pdf_end_object(&pdf);
+
+	for (int i = 0; i < pdf.num_pages; i++) {
+		int content_obj = 6 + i * 2;
+		int page_obj = 7 + i * 2;
+
+		pdf_begin_object(&pdf, content_obj);
+		buf_printf(&pdf.buf, "<< /Length %zu >>\nstream\n", pdf.pages[i].len);
+		buf_write(&pdf.buf, pdf.pages[i].data, pdf.pages[i].len);
+		buf_puts(&pdf.buf, "endstream\n");
+		pdf_end_object(&pdf);
+
+		pdf_begin_object(&pdf, page_obj);
+		buf_printf(&pdf.buf,
+			"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d] /Contents %d 0 R "
+			"/Resources << /Font << /F1 %d 0 R /F2 %d 0 R /F3 %d 0 R >> >> >>\n",
+			pages_obj, PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT, content_obj,
+			font_regular_obj, font_bold_obj, font_mono_obj);
+		pdf_end_object(&pdf);
+	}
+
 	size_t xref_offset = pdf.buf.len;
 	buf_puts(&pdf.buf, "xref\n");
-	buf_printf(&pdf.buf, "0 %d\n", pdf.num_objects + 1);
+	buf_printf(&pdf.buf, "0 %d\n", total_objects + 1);
 	buf_puts(&pdf.buf, "0000000000 65535 f \n");
-	for (int i = 0; i < pdf.num_objects; i++) {
+	for (int i = 1; i <= total_objects; i++) {
 		if (pdf.offsets[i] > 9999999999ULL) {
 			PUTS_ERR("Error: PDF too large for 10-digit xref offsets\n");
+			pdf_free_pages(&pdf);
+			free(pdf.offsets);
+			buf_free(&pdf.buf);
 			exit(1);
 		}
 		buf_printf(&pdf.buf, "%010zu 00000 n \n", pdf.offsets[i]);
 	}
 
-	// Trailer
 	buf_puts(&pdf.buf, "trailer\n");
-	buf_printf(&pdf.buf, "<< /Size %d /Root 1 0 R >>\n", pdf.num_objects + 1);
+	buf_printf(&pdf.buf, "<< /Size %d /Root %d 0 R >>\n", total_objects + 1, catalog_obj);
 	buf_puts(&pdf.buf, "startxref\n");
 	buf_printf(&pdf.buf, "%zu\n", xref_offset);
 	buf_puts(&pdf.buf, "%%EOF\n");
 
-	buf_free(&pdf.content);
+	pdf_free_pages(&pdf);
 	free(pdf.offsets);
 
 	*out_len = pdf.buf.len;
 	return pdf.buf.data;
+}
+
+#ifdef HAVE_PANGOCAIRO
+
+enum pdf_pango_font_role {
+	PDF_PANGO_FONT_SERIF,
+	PDF_PANGO_FONT_SANS,
+	PDF_PANGO_FONT_MONO
+};
+
+struct pdf_pango_writer {
+	struct buffer buf;
+	cairo_surface_t *surface;
+	cairo_t *cr;
+	double y_pos;
+	double top_margin;
+	double bottom_limit;
+	int page_count;
+	const char *serif_family;
+	const char *sans_family;
+	const char *mono_family;
+};
+
+static cairo_status_t pdf_pango_write_callback(void *closure, const unsigned char *data, unsigned int length)
+{
+	struct buffer *buf = closure;
+	buf_write(buf, (const char *)data, length);
+	return CAIRO_STATUS_SUCCESS;
+}
+
+static const char *pdf_pango_family(const struct pdf_pango_writer *pdf, enum pdf_pango_font_role role)
+{
+	switch (role) {
+		case PDF_PANGO_FONT_SERIF:
+			return pdf->serif_family;
+		case PDF_PANGO_FONT_SANS:
+			return pdf->sans_family ? pdf->sans_family : pdf->serif_family;
+		case PDF_PANGO_FONT_MONO:
+			return pdf->mono_family;
+	}
+	return "Sans";
+}
+
+static void pdf_pango_escape_text(struct buffer *buf, const char *text, bool attribute)
+{
+	while (*text) {
+		switch (*text) {
+			case '&':
+				buf_puts(buf, "&amp;");
+				break;
+			case '<':
+				buf_puts(buf, "&lt;");
+				break;
+			case '>':
+				buf_puts(buf, "&gt;");
+				break;
+			case '"':
+				if (attribute) buf_puts(buf, "&quot;");
+				else buf_putc(buf, '"');
+				break;
+			case '\'':
+				if (attribute) buf_puts(buf, "&apos;");
+				else buf_putc(buf, '\'');
+				break;
+			default:
+				buf_putc(buf, *text);
+				break;
+		}
+		text++;
+	}
+}
+
+static void pdf_pango_write_inlines(struct buffer *buf, struct inline_node *node, const char *mono_family)
+{
+	while (node) {
+		switch (node->type) {
+			case INLINE_TEXT:
+				if (node->text)
+					pdf_pango_escape_text(buf, node->text, false);
+				break;
+			case INLINE_BOLD:
+				buf_puts(buf, "<b>");
+				pdf_pango_write_inlines(buf, node->children, mono_family);
+				buf_puts(buf, "</b>");
+				break;
+			case INLINE_ITALIC:
+				buf_puts(buf, "<i>");
+				pdf_pango_write_inlines(buf, node->children, mono_family);
+				buf_puts(buf, "</i>");
+				break;
+			case INLINE_CODE:
+				buf_puts(buf, "<span font_family=\"");
+				pdf_pango_escape_text(buf, mono_family, true);
+				buf_puts(buf, "\">");
+				if (node->text)
+					pdf_pango_escape_text(buf, node->text, false);
+				buf_puts(buf, "</span>");
+				break;
+			case INLINE_LINK:
+				pdf_pango_write_inlines(buf, node->children, mono_family);
+				if (node->text) {
+					buf_puts(buf, " (");
+					pdf_pango_escape_text(buf, node->text, false);
+					buf_putc(buf, ')');
+				}
+				break;
+			case INLINE_IMAGE:
+				if (node->title) {
+					buf_puts(buf, "[Image: ");
+					pdf_pango_escape_text(buf, node->title, false);
+					buf_putc(buf, ']');
+				}
+				break;
+			case INLINE_LINEBREAK:
+				buf_putc(buf, '\n');
+				break;
+		}
+		node = node->next;
+	}
+}
+
+static char *pdf_pango_markup_from_inlines(struct inline_node *node, const char *mono_family)
+{
+	struct buffer buf;
+	buf_init(&buf);
+	pdf_pango_write_inlines(&buf, node, mono_family);
+	return buf_finish_malloc(&buf);
+}
+
+static PangoLayout *pdf_pango_create_layout(struct pdf_pango_writer *pdf, enum pdf_pango_font_role role,
+	double font_size, bool bold, bool italic, double width)
+{
+	PangoLayout *layout = pango_cairo_create_layout(pdf->cr);
+	PangoFontDescription *desc = pango_font_description_new();
+
+	pango_font_description_set_family(desc, pdf_pango_family(pdf, role));
+	pango_font_description_set_absolute_size(desc, font_size * PANGO_SCALE);
+	pango_font_description_set_weight(desc, bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL);
+	pango_font_description_set_style(desc, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
+	pango_layout_set_font_description(layout, desc);
+	pango_font_description_free(desc);
+
+	pango_layout_set_width(layout, (int)(width * PANGO_SCALE));
+	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+	pango_layout_set_spacing(layout, 1 * PANGO_SCALE);
+	return layout;
+}
+
+static void pdf_pango_new_page(struct pdf_pango_writer *pdf)
+{
+	if (pdf->page_count > 0)
+		cairo_show_page(pdf->cr);
+	pdf->page_count++;
+	pdf->y_pos = pdf->top_margin;
+}
+
+static void pdf_pango_ensure_space(struct pdf_pango_writer *pdf, double height)
+{
+	if (pdf->page_count == 0) {
+		pdf_pango_new_page(pdf);
+		return;
+	}
+	if (pdf->y_pos + height > pdf->bottom_limit && pdf->y_pos > pdf->top_margin)
+		pdf_pango_new_page(pdf);
+}
+
+static double pdf_pango_layout_height(PangoLayout *layout)
+{
+	int width = 0;
+	int height = 0;
+	pango_layout_get_pixel_size(layout, &width, &height);
+	return height > 0 ? (double)height : 0.0;
+}
+
+static void pdf_pango_render_markup(struct pdf_pango_writer *pdf, enum pdf_pango_font_role role,
+	double font_size, bool bold, bool italic, const char *markup,
+	double x_pos, double width, double spacing_after)
+{
+	PangoLayout *layout = pdf_pango_create_layout(pdf, role, font_size, bold, italic, width);
+	pango_layout_set_markup(layout, markup, -1);
+
+	double height = pdf_pango_layout_height(layout);
+	pdf_pango_ensure_space(pdf, height + spacing_after);
+
+	cairo_move_to(pdf->cr, x_pos, pdf->y_pos);
+	pango_cairo_show_layout(pdf->cr, layout);
+	pdf->y_pos += height + spacing_after;
+
+	g_object_unref(layout);
+}
+
+static void pdf_pango_render_text(struct pdf_pango_writer *pdf, enum pdf_pango_font_role role,
+	double font_size, bool bold, bool italic, const char *text,
+	double x_pos, double width, double spacing_after)
+{
+	PangoLayout *layout = pdf_pango_create_layout(pdf, role, font_size, bold, italic, width);
+	pango_layout_set_text(layout, text, -1);
+
+	double height = pdf_pango_layout_height(layout);
+	pdf_pango_ensure_space(pdf, height + spacing_after);
+
+	cairo_move_to(pdf->cr, x_pos, pdf->y_pos);
+	pango_cairo_show_layout(pdf->cr, layout);
+	pdf->y_pos += height + spacing_after;
+
+	g_object_unref(layout);
+}
+
+static void pdf_pango_write_blocks(struct pdf_pango_writer *pdf, struct block_node *node, double indent);
+
+static void pdf_pango_write_list(struct pdf_pango_writer *pdf, struct block_node *node, double indent)
+{
+	struct block_node *item = node->children;
+	int num = node->list.start;
+	double x_pos = PDF_MARGIN_LEFT + indent;
+	double width = PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT - x_pos;
+
+	while (item) {
+		if (item->children && item->children->type == BLOCK_PARAGRAPH && !item->children->next) {
+			struct buffer prefix_buf;
+			buf_init(&prefix_buf);
+			if (node->list.ordered)
+				buf_printf(&prefix_buf, "%d. ", num++);
+			else
+				buf_puts(&prefix_buf, "\xE2\x80\xA2 ");
+			buf_putc(&prefix_buf, '\0');
+
+			PangoLayout *prefix_layout = pdf_pango_create_layout(pdf, PDF_PANGO_FONT_SERIF,
+				PDF_BODY_FONT_SIZE, false, false, width);
+			pango_layout_set_text(prefix_layout, prefix_buf.data, -1);
+
+			int prefix_width = 0;
+			int prefix_height = 0;
+			pango_layout_get_pixel_size(prefix_layout, &prefix_width, &prefix_height);
+
+			char *markup = pdf_pango_markup_from_inlines(item->children->inlines, pdf->mono_family);
+			double body_x = x_pos + prefix_width + 4;
+			double body_width = PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT - body_x;
+			PangoLayout *body_layout = pdf_pango_create_layout(pdf, PDF_PANGO_FONT_SERIF,
+				PDF_BODY_FONT_SIZE, false, false, body_width);
+			pango_layout_set_markup(body_layout, markup, -1);
+
+			double body_height = pdf_pango_layout_height(body_layout);
+			double height = body_height > prefix_height ? body_height : prefix_height;
+			pdf_pango_ensure_space(pdf, height + PDF_PARAGRAPH_GAP);
+
+			cairo_move_to(pdf->cr, x_pos, pdf->y_pos);
+			pango_cairo_show_layout(pdf->cr, prefix_layout);
+			cairo_move_to(pdf->cr, body_x, pdf->y_pos);
+			pango_cairo_show_layout(pdf->cr, body_layout);
+			pdf->y_pos += height + PDF_PARAGRAPH_GAP;
+
+			free(markup);
+			buf_free(&prefix_buf);
+			g_object_unref(prefix_layout);
+			g_object_unref(body_layout);
+		} else {
+			struct buffer prefix_buf;
+			buf_init(&prefix_buf);
+			if (node->list.ordered)
+				buf_printf(&prefix_buf, "%d.", num++);
+			else
+				buf_puts(&prefix_buf, "\xE2\x80\xA2");
+			buf_putc(&prefix_buf, '\0');
+
+			pdf_pango_render_text(pdf, PDF_PANGO_FONT_SERIF, PDF_BODY_FONT_SIZE, false, false,
+				prefix_buf.data, x_pos, width, 2.0);
+			buf_free(&prefix_buf);
+			pdf_pango_write_blocks(pdf, item->children, indent + 18.0);
+		}
+
+		item = item->next;
+	}
+}
+
+static void pdf_pango_write_blocks(struct pdf_pango_writer *pdf, struct block_node *node, double indent)
+{
+	double x_pos = PDF_MARGIN_LEFT + indent;
+	double width = PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT - x_pos;
+
+	while (node) {
+		switch (node->type) {
+			case BLOCK_PARAGRAPH:
+				{
+					char *markup = pdf_pango_markup_from_inlines(node->inlines, pdf->mono_family);
+					pdf_pango_render_markup(pdf, PDF_PANGO_FONT_SERIF, PDF_BODY_FONT_SIZE,
+						false, false, markup, x_pos, width, PDF_PARAGRAPH_GAP);
+					free(markup);
+				}
+				break;
+			case BLOCK_HEADING:
+				{
+					double size = node->heading.level == 1 ? 20.0 : 16.0 - (node->heading.level - 2);
+					if (size < 13.0)
+						size = 13.0;
+					char *markup = pdf_pango_markup_from_inlines(node->inlines, pdf->mono_family);
+					pdf_pango_render_markup(pdf, PDF_PANGO_FONT_SANS, size,
+						true, false, markup, x_pos, width, PDF_HEADING_GAP);
+					free(markup);
+				}
+				break;
+			case BLOCK_CODE_BLOCK:
+				if (node->code_block.code)
+					pdf_pango_render_text(pdf, PDF_PANGO_FONT_MONO, 10.0, false, false,
+						node->code_block.code, x_pos + 12.0, width - 12.0, PDF_PARAGRAPH_GAP);
+				break;
+			case BLOCK_BLOCKQUOTE:
+				pdf_pango_write_blocks(pdf, node->children, indent + 20.0);
+				break;
+			case BLOCK_LIST:
+				pdf_pango_write_list(pdf, node, indent);
+				break;
+			case BLOCK_LIST_ITEM:
+				break;
+			case BLOCK_THEMATIC_BREAK:
+				pdf_pango_ensure_space(pdf, 20.0);
+				cairo_move_to(pdf->cr, PDF_MARGIN_LEFT, pdf->y_pos + 8.0);
+				cairo_line_to(pdf->cr, PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT, pdf->y_pos + 8.0);
+				cairo_set_line_width(pdf->cr, 0.5);
+				cairo_stroke(pdf->cr);
+				pdf->y_pos += 20.0;
+				break;
+			case BLOCK_TABLE:
+			case BLOCK_TABLE_ROW:
+			case BLOCK_TABLE_CELL:
+				break;
+		}
+		node = node->next;
+	}
+}
+
+static char *write_pdf_pango(struct document *doc, size_t *out_len)
+{
+	struct pdf_pango_writer pdf;
+	buf_init(&pdf.buf);
+	pdf.surface = cairo_pdf_surface_create_for_stream(pdf_pango_write_callback, &pdf.buf,
+		PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT);
+	pdf.cr = cairo_create(pdf.surface);
+	pdf.top_margin = (double)(PDF_PAGE_HEIGHT - PDF_MARGIN_TOP);
+	pdf.bottom_limit = (double)(PDF_PAGE_HEIGHT - PDF_MARGIN_BOTTOM);
+	pdf.page_count = 0;
+	pdf.serif_family = pdf_font_serif ? pdf_font_serif :
+		(pdf_font_text ? pdf_font_text : "Serif");
+	pdf.sans_family = pdf_font_sans ? pdf_font_sans : NULL;
+	pdf.mono_family = pdf_font_mono ? pdf_font_mono : "Monospace";
+
+	if (cairo_surface_status(pdf.surface) != CAIRO_STATUS_SUCCESS ||
+		cairo_status(pdf.cr) != CAIRO_STATUS_SUCCESS) {
+		cairo_destroy(pdf.cr);
+		cairo_surface_destroy(pdf.surface);
+		buf_free(&pdf.buf);
+		return NULL;
+	}
+
+	cairo_set_source_rgb(pdf.cr, 0.0, 0.0, 0.0);
+	pdf_pango_new_page(&pdf);
+	pdf_pango_write_blocks(&pdf, doc->blocks, 0.0);
+
+	cairo_surface_finish(pdf.surface);
+	if (cairo_surface_status(pdf.surface) != CAIRO_STATUS_SUCCESS ||
+		cairo_status(pdf.cr) != CAIRO_STATUS_SUCCESS) {
+		cairo_destroy(pdf.cr);
+		cairo_surface_destroy(pdf.surface);
+		buf_free(&pdf.buf);
+		return NULL;
+	}
+
+	cairo_destroy(pdf.cr);
+	cairo_surface_destroy(pdf.surface);
+
+	*out_len = pdf.buf.len;
+	return buf_finish_malloc(&pdf.buf);
+}
+
+#endif
+
+static char *write_pdf(struct document *doc, size_t *out_len)
+{
+#ifdef HAVE_PANGOCAIRO
+	return write_pdf_pango(doc, out_len);
+#else
+	return write_pdf_basic(doc, out_len);
+#endif
 }
 
 // ============================================================================
@@ -8759,6 +9485,10 @@ static void print_help(void)
 		"  -t, --to FORMAT      Output format\n"
 		"  -o, --output FILE    Output file (required for binary formats)\n"
 		"  -B, --max-bytes N    Fail if input file size > N (0 = unlimited)\n"
+		"      --pdf-font-text FAMILY   Default PDF font family for non-code text\n"
+		"      --pdf-font-serif FAMILY  PDF serif font family\n"
+		"      --pdf-font-sans FAMILY   PDF sans-serif font family\n"
+		"      --pdf-font-mono FAMILY   PDF monospace font family\n"
 		"  -S, --strict         Fail on unsupported constructs\n"
 		"  -h, --help           Show this help\n"
 		"\n"
@@ -8813,11 +9543,22 @@ int main(int argc, char **argv)
 {
 	arena_init(64 * 1024);  // 64KB initial size
 
+	enum {
+		OPT_PDF_FONT_TEXT = 1000,
+		OPT_PDF_FONT_SERIF,
+		OPT_PDF_FONT_SANS,
+		OPT_PDF_FONT_MONO
+	};
+
 	struct option options[] = {
 		{ "from", required_argument, 0, 'f' },
 		{ "to", required_argument, 0, 't' },
 		{ "output", required_argument, 0, 'o' },
 		{ "max-bytes", required_argument, 0, 'B' },
+		{ "pdf-font-text", required_argument, 0, OPT_PDF_FONT_TEXT },
+		{ "pdf-font-serif", required_argument, 0, OPT_PDF_FONT_SERIF },
+		{ "pdf-font-sans", required_argument, 0, OPT_PDF_FONT_SANS },
+		{ "pdf-font-mono", required_argument, 0, OPT_PDF_FONT_MONO },
 		{ "strict", no_argument, 0, 'S' },
 		{ "help", no_argument, 0, 'h' },
 		{ 0, 0, 0, 0 }
@@ -8857,6 +9598,18 @@ int main(int argc, char **argv)
 				}
 				case 'o':
 					output_path = optarg;
+					break;
+				case OPT_PDF_FONT_TEXT:
+					pdf_font_text = optarg;
+					break;
+				case OPT_PDF_FONT_SERIF:
+					pdf_font_serif = optarg;
+					break;
+				case OPT_PDF_FONT_SANS:
+					pdf_font_sans = optarg;
+					break;
+				case OPT_PDF_FONT_MONO:
+					pdf_font_mono = optarg;
 					break;
 				case 'S':
 					strict_mode = true;
@@ -8919,6 +9672,13 @@ int main(int argc, char **argv)
 		PUTS_ERR("Error: cannot determine output format, use -t\n");
 		goto cleanup;
 	}
+
+#ifndef HAVE_PANGOCAIRO
+	if (to_fmt == FMT_PDF && (pdf_font_text || pdf_font_serif || pdf_font_sans || pdf_font_mono)) {
+		PUTS_ERR("Error: --pdf-font-* options require pangocairo support at build time\n");
+		goto cleanup;
+	}
+#endif
 
 	if (strict_mode && from_fmt == FMT_MARKDOWN) {
 		if (strcasestr(input_data, "<table") != NULL) {
